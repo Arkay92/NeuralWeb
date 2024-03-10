@@ -16,7 +16,7 @@ Ensure you have Python 3.x installed. Clone the repository and install the requi
 
 ```bash
 git clone https://github.com/Arkay92/NeuralWeb.git
-cd AI-Driven-Web-Scraping-and-Modeling
+cd NeuralWeb
 pip install -r requirements.txt
 ```
 
