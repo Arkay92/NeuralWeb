@@ -15,7 +15,7 @@ This repository contains an advanced Python script designed for web scraping, da
 Ensure you have Python 3.x installed. Clone the repository and install the required packages:
 
 ```bash
-git clone https://github.com/<your-username>/AI-Driven-Web-Scraping-and-Modeling.git
+git clone https://github.com/Arkay92/NeuralWeb.git
 cd AI-Driven-Web-Scraping-and-Modeling
 pip install -r requirements.txt
 ```
