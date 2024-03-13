@@ -60,6 +60,7 @@ nltk.download('averaged_perceptron_tagger')
 nltk.download('punkt')  # Download the Punkt tokenizer models
 stop_words = set(stopwords.words('english'))
 porter = PorterStemmer()
+visited_urls = set() 
 
 # Initialize or load label map
 if os.path.exists(LABEL_MAP_PATH):
@@ -81,7 +82,7 @@ def get_internal_links(soup, base_url):
     internal_links = set()
     for link in soup.find_all('a', href=True):
         href = link['href']
-        if href.startswith('/'):  # Relative URL
+        if href.startswith('/') or not href.startswith(('http://', 'https://')):  # Relative URL or incomplete URL
             internal_link = base_url + href
             internal_links.add(internal_link)
         elif href.startswith(base_url):  # Absolute URL but internal
@@ -95,7 +96,10 @@ def scrape_website(url, depth=0):
         return None, None
 
     try:
-        response = requests.get(url, timeout=10)
+        # Remove extensions and index.php from URL
+        cleaned_url = re.sub(r'(/index\.php$|\.html$)', '', url)
+
+        response = requests.get(cleaned_url, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
         body_tag = soup.find('body')
@@ -106,7 +110,7 @@ def scrape_website(url, depth=0):
 
             # Recursively scrape internal links if depth allows
             if depth < MAX_DEPTH:
-                internal_links = get_internal_links(soup, url)
+                internal_links = get_internal_links(soup, cleaned_url)
                 for link in internal_links:
                     if can_fetch(link) and link not in visited_urls:
                         link_content, _ = scrape_website(link, depth+1)
