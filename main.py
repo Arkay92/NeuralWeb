@@ -2,34 +2,26 @@ import requests
 from bs4 import BeautifulSoup, Comment
 import pandas as pd
 import os, schedule, time, logging, re, nltk, json, random
-from sklearn.model_selection import train_test_split
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Input, Embedding, GlobalAveragePooling1D, Dense, LSTM, Bidirectional
-from tensorflow.keras.preprocessing.text import Tokenizer
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from nltk.corpus import stopwords
+from nltk.corpus import stopwords, wordnet
 from nltk.stem import PorterStemmer
 from concurrent.futures import ThreadPoolExecutor
 from urllib.robotparser import RobotFileParser
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 import matplotlib.pyplot as plt
+import numpy as np
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-
 # Load or set default configuration
 config = {
-    "MAX_SEQUENCE_LENGTH": 500,
-    "NUM_WORDS": 20000,  # Increased vocabulary size
-    "MAX_DEPTH": 2,
+    "MAX_VECTOR_SIZE": 10000,  # Hypervector dimensionality
     "TEST_SPLIT": 0.1,
     "URLS": [
         'https://www.bbc.com',
         'https://www.cnn.com',
-        # Consider adding more diverse URLs
-    ]
+    ],
+    "RATE_LIMIT": 1  # seconds between requests to prevent overloading
 }
 
 # Load configuration from file if exists
@@ -40,11 +32,10 @@ except FileNotFoundError:
     logging.info("No config file found, using default configuration.")
 
 # Apply configuration
-MAX_SEQUENCE_LENGTH = config['MAX_SEQUENCE_LENGTH']
-NUM_WORDS = config['NUM_WORDS']
-MAX_DEPTH = config['MAX_DEPTH']
+MAX_VECTOR_SIZE = config['MAX_VECTOR_SIZE']
 TEST_SPLIT = config['TEST_SPLIT']
 URLS = config['URLS']
+RATE_LIMIT = config['RATE_LIMIT']
 
 # Prepare data storage
 DATA_DIR = 'data'
@@ -57,10 +48,11 @@ LABEL_MAP_PATH = os.path.join(DATA_DIR, 'label_map.pkl')
 nltk.download('stopwords')
 nltk.download('wordnet')
 nltk.download('averaged_perceptron_tagger')
-nltk.download('punkt')  # Download the Punkt tokenizer models
+nltk.download('punkt')
 stop_words = set(stopwords.words('english'))
 porter = PorterStemmer()
-visited_urls = set() 
+visited_urls = set()
+robot_cache = {}
 
 # Initialize or load label map
 if os.path.exists(LABEL_MAP_PATH):
@@ -68,39 +60,57 @@ if os.path.exists(LABEL_MAP_PATH):
 else:
     label_map = {'Long Text': 0, 'Short Text': 1, 'Media Rich': 2}
 
-def can_fetch(url):
-    rp = RobotFileParser()
-    rp.set_url(url + '/robots.txt')
-    rp.read()
-    # Assuming your user agent is '*', change as needed
-    return rp.can_fetch('*', url)
+# Function to respect rate limiting
+def rate_limit_delay():
+    time.sleep(RATE_LIMIT)
 
+# Retry mechanism with exponential backoff
+def fetch_with_retries(url, retries=3, backoff=2):
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            if attempt == retries - 1:
+                logging.error(f"Request failed after {retries} retries for {url}: {e}")
+                return None
+            else:
+                logging.warning(f"Retrying {url} in {backoff ** attempt} seconds due to: {e}")
+                time.sleep(backoff ** attempt)
+
+# Caching robots.txt
+def can_fetch(url):
+    domain = re.findall(r'(https?://[^/]+)', url)[0]
+    if domain not in robot_cache:
+        rp = RobotFileParser()
+        rp.set_url(domain + '/robots.txt')
+        rp.read()
+        robot_cache[domain] = rp
+    return robot_cache[domain].can_fetch('*', url)
+
+# Get internal links with base URL
 def get_internal_links(soup, base_url):
-    """
-    Collect internal links from a BeautifulSoup object and a base URL.
-    """
     internal_links = set()
     for link in soup.find_all('a', href=True):
         href = link['href']
-        if href.startswith('/') or not href.startswith(('http://', 'https://')):  # Relative URL or incomplete URL
+        if href.startswith('/') or not href.startswith(('http://', 'https://')):
             internal_link = base_url + href
             internal_links.add(internal_link)
-        elif href.startswith(base_url):  # Absolute URL but internal
+        elif href.startswith(base_url):
             internal_links.add(href)
     return internal_links
 
-# 1. Web Scraping with Error Handling and Recursive Depth
-def scrape_website(url, depth=0):
+# Web Scraping with Error Handling, Retry, and Recursive Depth
+def scrape_website(url, depth=0, max_depth=2):
     print(f"Scraping {url} at depth {depth}...")
-    if depth > MAX_DEPTH:
+    if depth > max_depth:
         return None, None
 
-    try:
-        # Remove extensions and index.php from URL
-        cleaned_url = re.sub(r'(/index\.php$|\.html$)', '', url)
+    rate_limit_delay()  # Apply rate limiting
 
-        response = requests.get(cleaned_url, timeout=10)
-        response.raise_for_status()
+    response = fetch_with_retries(url)
+    if response:
         soup = BeautifulSoup(response.content, 'html.parser')
         body_tag = soup.find('body')
         if body_tag:
@@ -108,12 +118,11 @@ def scrape_website(url, depth=0):
                 element.extract()
             body_content = ' '.join(body_tag.stripped_strings)
 
-            # Recursively scrape internal links if depth allows
-            if depth < MAX_DEPTH:
-                internal_links = get_internal_links(soup, cleaned_url)
+            if depth < max_depth:
+                internal_links = get_internal_links(soup, url)
                 for link in internal_links:
                     if can_fetch(link) and link not in visited_urls:
-                        link_content, _ = scrape_website(link, depth+1)
+                        link_content, _ = scrape_website(link, depth + 1)
                         if link_content:
                             body_content += ' ' + link_content
                             visited_urls.add(link)
@@ -123,16 +132,12 @@ def scrape_website(url, depth=0):
                         logging.info(f"Scraping of {link} disallowed by robots.txt")
             print(f"Scraped successfully: {url}")
             return body_content, soup
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Request failed for {url}: {e}")
     return None, None
 
-# 2. Heuristic Labeling with Improved Strategy
+# Heuristic Labeling with Improved Strategy
 def generate_label(soup):
     if soup is None:
         return None
-
-    # Example of an improved heuristic
     text_length = len(soup.get_text())
     num_images = len(soup.find_all('img'))
     num_videos = len(soup.find_all('video'))
@@ -143,64 +148,113 @@ def generate_label(soup):
         return 'Long Text'
     else:
         return 'Short Text'
-    
-    pass
 
-# 3. Advanced Data Preprocessing with Augmentation
+# Hyperdimensional Computing (HDC) based data preprocessing
+def generate_random_hypervector(size):
+    """Generate a random hypervector of +1/-1 with the specified dimensionality."""
+    return np.random.choice([-1, 1], size=size)
+
+def superposition(vectors):
+    """Perform superposition (element-wise summing) of multiple hypervectors."""
+    return np.sign(np.sum(vectors, axis=0))
+
+def bind(vectors):
+    """Perform binding (element-wise multiplication) of hypervectors."""
+    result = vectors[0]
+    for vector in vectors[1:]:
+        result = result * vector
+    return result
+
+def text_to_hypervector(text):
+    """Convert text to a hypervector using bundling and binding."""
+    words = clean_text(text).split()
+    word_vectors = [generate_random_hypervector(MAX_VECTOR_SIZE) for _ in words]
+    return superposition(word_vectors)  # Hyperdimensional encoding through superposition
+
+# Text cleaning
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r'\[.*?\]', '', text)
+    text = re.sub(r'https?://\S+|www\.\S+', '', text)
+    text = re.sub(r'<.*?>+', '', text)
+    text = re.sub(r'[^a-zA-Z\s]', '', text)
+    text = ' '.join([word for word in text.split() if word not in stop_words])
+    return text
+
+# Symbolic Inference: Neuro-Symbolic Classification
+def symbolic_inference(features):
+    """Perform neuro-symbolic reasoning based on the hypervector input."""
+    # Example neuro-symbolic logic:
+    # 1. Check for certain characteristics (e.g., length, specific patterns).
+    # 2. Use logical rules for classification (e.g., length-based or content-based rules).
+    
+    predictions = []
+    for feature in features:
+        magnitude = np.sum(np.abs(feature))  # Example: Summing absolute values as a proxy for content magnitude
+        if magnitude > 5000:
+            predictions.append(0)  # 'Long Text'
+        elif magnitude < 3000 and random.random() > 0.5:
+            predictions.append(1)  # 'Short Text'
+        else:
+            predictions.append(2)  # 'Media Rich'
+    
+    return predictions
+
+# Data Augmentation
 def augment_text(text):
     words = text.split()
     augmented_text = words.copy()
     
-    # Choose 10% of words in the text to be replaced
+    # Synonym replacement
     n_replace = max(1, int(len(words) * 0.1))
-
     for _ in range(n_replace):
         idx_to_replace = random.randint(0, len(words) - 1)
         synonyms = get_synonyms(words[idx_to_replace])
-        
         if synonyms:
             synonym = random.choice(synonyms)
             augmented_text[idx_to_replace] = synonym
-    
+
     return ' '.join(augmented_text)
 
 def get_synonyms(word):
     synonyms = set()
-    
     for syn in wordnet.synsets(word):
         for lemma in syn.lemmas():
             synonym = lemma.name().replace('_', ' ')
             if synonym != word:
                 synonyms.add(synonym)
-                
     return list(synonyms)
 
+def random_deletion(text, p=0.1):
+    words = text.split()
+    if len(words) == 1:
+        return text
+    retained_words = [word for word in words if random.random() > p]
+    return ' '.join(retained_words)
+
+def random_swap(text, n_swaps=1):
+    words = text.split()
+    if len(words) < 2:
+        return text
+    for _ in range(n_swaps):
+        idx1, idx2 = random.sample(range(len(words)), 2)
+        words[idx1], words[idx2] = words[idx2], words[idx1]
+    return ' '.join(words)
+
+# Preprocessing Data
 def preprocess_data(raw_data):
     augmented_data = []
     for text in raw_data:
         clean_text_data = clean_text(text)
         augmented_data.append(clean_text_data)
-        # Apply simple data augmentation: synonym replacement
         augmented_data.append(augment_text(clean_text_data))
-    
-    tokenizer = Tokenizer(num_words=NUM_WORDS, oov_token="<OOV>")
-    tokenizer.fit_on_texts(augmented_data)
-    sequences = tokenizer.texts_to_sequences(augmented_data)
-    padded_sequences = pad_sequences(sequences, padding='post', maxlen=MAX_SEQUENCE_LENGTH)
-    
-    return padded_sequences
+        augmented_data.append(random_deletion(clean_text_data))
+        augmented_data.append(random_swap(clean_text_data))
 
-def clean_text(text):
-    text = text.lower()  # Lowercase text
-    text = re.sub(r'\[.*?\]', '', text)  # Remove text in brackets
-    text = re.sub(r'https?://\S+|www\.\S+', '', text)  # Remove URLs
-    text = re.sub(r'<.*?>+', '', text)  # Remove HTML tags
-    text = re.sub(r'[^a-zA-Z\s]', '', text)  # Remove punctuation and numbers
-    text = ' '.join([word for word in text.split() if word not in stop_words])  # Remove stopwords
-    text = ' '.join([porter.stem(word) for word in text.split()])  # Stemming
-    return text
+    hypervectors = [text_to_hypervector(text) for text in augmented_data]
+    return hypervectors
 
-# 4. Data Integration with Error Handling
+# Data integration with Error Handling
 def integrate_data(new_data, existing_data_path):
     if new_data is None:
         return None
@@ -214,61 +268,28 @@ def integrate_data(new_data, existing_data_path):
     integrated_data.to_pickle(existing_data_path)
     return integrated_data
 
-def retrain_model(features, labels):
-    model = Sequential([
-        Input(shape=(MAX_SEQUENCE_LENGTH,)),
-        Embedding(input_dim=NUM_WORDS, output_dim=100, input_length=MAX_SEQUENCE_LENGTH),
-        Bidirectional(LSTM(64, return_sequences=True)),
-        GlobalAveragePooling1D(),
-        Dense(64, activation='relu'),
-        Dense(len(label_map), activation='softmax')
-    ])
+# Evaluation and Performance Metrics
+def evaluate_model(predictions, labels):
+    precision = precision_score(labels, predictions, average='weighted')
+    recall = recall_score(labels, predictions, average='weighted')
+    f1 = f1_score(labels, predictions, average='weighted')
 
-    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-    
-    # Define callbacks
-    early_stopping = EarlyStopping(monitor='val_loss', patience=3, verbose=1, mode='min', restore_best_weights=True)
-    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=2, verbose=1, mode='min', min_lr=0.001)
-
-    # Train the model with added data augmentation
-    history = model.fit(
-        features, 
-        labels, 
-        epochs=20,  # Consider adjusting based on performance
-        validation_split=TEST_SPLIT,  # Use validation_split for simplicity
-        callbacks=[early_stopping, reduce_lr]
-    )
-
-    # Evaluation with more metrics
-    evaluate_model(model, features, labels)
-
-    return model
-
-def evaluate_model(model, features, labels):
-    predictions = model.predict(features)
-    predicted_labels = predictions.argmax(axis=1)
-
-    precision = precision_score(labels, predicted_labels, average='weighted')
-    recall = recall_score(labels, predicted_labels, average='weighted')
-    f1 = f1_score(labels, predicted_labels, average='weighted')
-    
     logging.info(f'Precision: {precision}, Recall: {recall}, F1 Score: {f1}')
-    cm = confusion_matrix(labels, predicted_labels)
+    cm = confusion_matrix(labels, predictions)
     plot_confusion_matrix(cm)
 
+# Plot Confusion Matrix
 def plot_confusion_matrix(cm):
-    # Use matplotlib to plot the confusion matrix
     plt.figure(figsize=(10, 7))
     plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
     plt.title('Confusion Matrix')
     plt.colorbar()
-    # Additional code for labeling the axes with class names if desired
     plt.tight_layout()
     plt.ylabel('True label')
     plt.xlabel('Predicted label')
     plt.show()
 
-# 6. Automated Retraining Setup with ThreadPoolExecutor for Concurrency
+# Concurrency and Automated Retraining Setup
 def automated_retraining():
     print("Starting automated retraining...")
     with ThreadPoolExecutor(max_workers=len(URLS)) as executor:
@@ -281,18 +302,9 @@ def automated_retraining():
                 preprocessed_content = preprocess_data([body_content])
                 integrated_features = integrate_data(preprocessed_content, EXISTING_FEATURES_PATH)
                 integrated_labels = integrate_data([label], EXISTING_LABELS_PATH)
-                if len(integrated_features) > 1:
-                    if integrated_features is not None and integrated_labels is not None:
-                        retrained_model = retrain_model(integrated_features, integrated_labels)
-                        if retrained_model:
-                            retrained_model.save('retrained_model.h5')
-                            print("Model retrained and saved successfully.")
-                        else:
-                            logging.error("Model retraining failed.")
-                    else:
-                        logging.error("Data integration failed.")
-            else:
-                logging.error("Scraping or labeling failed.")
+                if integrated_features is not None and integrated_labels is not None:
+                    predictions = symbolic_inference(integrated_features)  # Neuro-symbolic reasoning for classification
+                    evaluate_model(predictions, integrated_labels)
 
 def update_label_map(label):
     global label_map
@@ -302,7 +314,7 @@ def update_label_map(label):
         pd.to_pickle(label_map, LABEL_MAP_PATH)
         print(f"Updated label map with new label: {label}")
 
-# Main execution
+# Run schedule
 if __name__ == "__main__":
     automated_retraining()
     schedule.every().day.at("01:00").do(automated_retraining)
